@@ -1,0 +1,528 @@
+-- ============================================================
+--  WALKING IN THE GRAVEYARD  --  Ghost AI + Round Score System
+--  Gorilla Tag Custom Map  |  Luau Script
+--  PDF 스펙: 유령 2마리 / 5라운드 / HP 2칸 / 타이머 90초
+--           공격딜레이 0.5초 / 순위UI / 결과화면
+-- ============================================================
+--
+--  SETUP (Unity Editor에서 1번만):
+--  1. Window > AI > Navigation 에서 Ground 선택 후 Bake
+--  2. GhostAgent (lua_EntityID=1), GhostAgent2 (lua_EntityID=2) 씬에 배치됨
+--  3. Spawner (MapSpawnManager + 템플릿) 씬에 배치됨
+--  4. 모델 교체 시 lua_EntityID 값이 GHOST1_ID / GHOST2_ID 와 일치해야 함
+-- ============================================================
+
+-- ── 상수 ─────────────────────────────────────────────────────
+local GHOST1_ID       = 1      -- 첫 번째 유령 lua_EntityID
+local GHOST2_ID       = 2      -- 두 번째 유령 lua_EntityID
+local TARGETING_RANGE = 8      -- 추격 시작 거리 (m)
+local ATTACK_RANGE    = 1.5    -- 공격 판정 거리 (m)
+local ATTACK_DELAY    = 0.5    -- 공격 애니 후 판정까지 딜레이 (초) ← PDF 명시
+local ROUND_DURATION  = 90     -- 라운드당 시간 (초)
+local MAX_ROUNDS      = 5      -- 총 라운드 수
+local MAX_HP          = 2      -- 플레이어 HP
+local BETWEEN_ROUNDS  = 5      -- 라운드 사이 대기 시간 (초)
+
+-- 머티리얼 인덱스
+local MAT_NORMAL = 0   -- 일반 (피격 없음)
+local MAT_HIT    = 2   -- 1회 피격 (감염 외관)
+local MAT_OUT    = 3   -- 탈락 (완전 감염)
+
+-- ── 상태 변수 ─────────────────────────────────────────────────
+local ghost1         = nil
+local ghost2         = nil
+local scriptReady    = false
+local waitingForInit = false
+local tickCount      = 0
+
+-- 라운드/점수
+local currentRound   = 0
+local roundActive    = false
+local roundStartTime = 0
+local gameFinished   = false
+
+-- 플레이어 데이터 [playerName] = 값
+local playerHP    = {}   -- 현재 라운드 HP
+local eliminated  = {}   -- 이번 라운드 탈락 여부
+local roundWins   = {}   -- 라운드 누적 우승 횟수
+
+-- 유령 AI 상태 [1 또는 2] = { patrol, target }
+local ghostState  = {
+    [1] = { patrol = nil, target = nil },
+    [2] = { patrol = nil, target = nil },
+}
+
+local patrolPoints     = {}
+local DelayedFunctions = {}
+
+-- ── 타이머 헬퍼 ───────────────────────────────────────────────
+local function setTimeout(delay, fn)
+    table.insert(DelayedFunctions, { t = os.clock() + delay, fn = fn })
+end
+
+local function handleTimeouts()
+    local now = os.clock()
+    for i = #DelayedFunctions, 1, -1 do
+        if now >= DelayedFunctions[i].t then
+            DelayedFunctions[i].fn()
+            table.remove(DelayedFunctions, i)
+        end
+    end
+end
+
+-- ── UI 헬퍼 ──────────────────────────────────────────────────
+local function setText(goName, str)
+    local go = GameObject.findGameObject(goName)
+    if go ~= nil then go:setText(str) end
+end
+
+-- HP 하트 문자열 생성
+local function hpBar(hp)
+    local s = ""
+    for i = 1, MAX_HP do
+        s = s .. (i <= hp and "+" or "-")
+    end
+    return s
+end
+
+-- 순위 텍스트 빌드 (scoreBoard)
+local function updateScoreBoard()
+    local rows = {}
+    for _, ply in ipairs(Players) do
+        if ply ~= nil then
+            table.insert(rows, {
+                name = ply.playerName,
+                wins = roundWins[ply.playerName] or 0,
+                hp   = playerHP[ply.playerName]  or 0,
+                out  = eliminated[ply.playerName] or false,
+            })
+        end
+    end
+    table.sort(rows, function(a, b) return a.wins > b.wins end)
+
+    local rankTag = {"1st","2nd","3rd","4th"}
+    local s = "  ROUND " .. tostring(currentRound) .. "/" .. tostring(MAX_ROUNDS) .. "\n"
+    s = s .. "─────────────\n"
+    for i = 1, math.min(#rows, 4) do
+        local bar = hpBar(rows[i].hp)
+        local mark = rows[i].out and " OUT" or ""
+        s = s .. rankTag[i] .. " " .. rows[i].name
+              .. "  W:" .. tostring(rows[i].wins)
+              .. "  [" .. bar .. "]" .. mark .. "\n"
+    end
+    setText("scoreBoard", s)
+end
+
+-- 타이머 텍스트 업데이트 (roundTimer)
+local function updateTimer()
+    if not roundActive then return end
+    local elapsed   = os.clock() - roundStartTime
+    local remaining = math.max(0, ROUND_DURATION - elapsed)
+    local m = math.floor(remaining / 60)
+    local sec = math.floor(remaining % 60)
+    setText("roundTimer", string.format("%02d:%02d", m, sec))
+end
+
+-- ── 순위 결정 헬퍼 ───────────────────────────────────────────
+local function countAlive()
+    local count, last = 0, nil
+    for _, ply in ipairs(Players) do
+        if ply ~= nil and not (eliminated[ply.playerName]) then
+            count = count + 1
+            last  = ply
+        end
+    end
+    return count, last
+end
+
+-- ── 라운드 시작 ──────────────────────────────────────────────
+local function startRound(num)
+    currentRound   = num
+    roundActive    = true
+    roundStartTime = os.clock()
+
+    -- 플레이어 HP 초기화 + 머티리얼 리셋
+    playerHP   = {}
+    eliminated = {}
+    for _, ply in ipairs(Players) do
+        if ply ~= nil then
+            playerHP[ply.playerName]   = MAX_HP
+            eliminated[ply.playerName] = false
+            ply.playerMaterial         = MAT_NORMAL
+        end
+    end
+
+    -- 유령 패트롤 시작
+    if ghost1 ~= nil then
+        local gs = ghostState[1]
+        gs.target = nil; gs.patrol = nil
+    end
+    if ghost2 ~= nil then
+        local gs = ghostState[2]
+        gs.target = nil; gs.patrol = nil
+    end
+
+    updateScoreBoard()
+    setText("roundTimer", string.format("%02d:%02d",
+        math.floor(ROUND_DURATION/60), ROUND_DURATION % 60))
+
+    emitEvent("ghost_roundStart", { num })
+    print("[Ghost] Round " .. tostring(num) .. " START")
+end
+
+-- ── 라운드 종료 ──────────────────────────────────────────────
+local function endRound(winner)
+    roundActive = false
+
+    -- 유령 정지
+    ghostState[1].target = nil
+    ghostState[2].target = nil
+
+    -- 우승자 처리
+    if winner ~= nil then
+        roundWins[winner.playerName] = (roundWins[winner.playerName] or 0) + 1
+        playSound(2, winner.bodyPosition, 0.8)
+        print("[Ghost] Round " .. tostring(currentRound)
+              .. " winner = " .. winner.playerName)
+    end
+
+    -- 탈락하지 않은 플레이어도 머티리얼 리셋
+    for _, ply in ipairs(Players) do
+        if ply ~= nil then ply.playerMaterial = MAT_NORMAL end
+    end
+
+    updateScoreBoard()
+    emitEvent("ghost_roundEnd", { currentRound, winner })
+
+    -- 마지막 라운드면 최종 결과
+    if currentRound >= MAX_ROUNDS then
+        gameFinished = true
+
+        local rows = {}
+        for _, ply in ipairs(Players) do
+            if ply ~= nil then
+                table.insert(rows, {
+                    name = ply.playerName,
+                    wins = roundWins[ply.playerName] or 0,
+                })
+            end
+        end
+        table.sort(rows, function(a, b) return a.wins > b.wins end)
+
+        local rankTag = {"1st","2nd","3rd","4th"}
+        local res = "    RESULT    \n══════════════\n"
+        for i = 1, math.min(#rows, 4) do
+            res = res .. rankTag[i] .. "  " .. rows[i].name
+                      .. "  " .. tostring(rows[i].wins) .. " wins\n"
+        end
+        setText("scoreBoard", res)
+        setText("roundTimer", "GAME OVER")
+        print("[Ghost] GAME OVER")
+        return
+    end
+
+    -- 다음 라운드 예약
+    setText("roundTimer", "NEXT IN " .. tostring(BETWEEN_ROUNDS) .. "s")
+    setTimeout(BETWEEN_ROUNDS, function()
+        startRound(currentRound + 1)
+    end)
+end
+
+-- ── 플레이어 태그 ─────────────────────────────────────────────
+local function tagPlayer(ply)
+    if ply == nil then return end
+    if not roundActive then return end
+    if eliminated[ply.playerName] then return end
+
+    local hp = (playerHP[ply.playerName] or MAX_HP) - 1
+    playerHP[ply.playerName] = hp
+    playSound(0, ply.bodyPosition, 0.5)
+
+    if hp <= 0 then
+        -- 탈락
+        eliminated[ply.playerName] = true
+        ply.playerMaterial = MAT_OUT
+        print("[Ghost] " .. ply.playerName .. " 탈락!")
+
+        local alive, last = countAlive()
+        if alive <= 1 then
+            endRound(last)
+        end
+    else
+        -- 피격 (생존)
+        ply.playerMaterial = MAT_HIT
+        print("[Ghost] " .. ply.playerName .. " 피격! HP=" .. tostring(hp))
+    end
+
+    emitEvent("ghost_tagPlayer", { ply.playerName, hp })
+    updateScoreBoard()
+end
+
+-- ── 패트롤 ───────────────────────────────────────────────────
+local function initPatrolPoints()
+    for i = 1, 20 do
+        local pt = GameObject.findGameObject("patrolPoint_" .. tostring(i))
+        if pt == nil then break end
+        table.insert(patrolPoints, pt)
+    end
+    print("[Ghost] 패트롤 포인트 " .. tostring(#patrolPoints) .. "개")
+end
+
+local function pickPatrol(exceptPos)
+    if #patrolPoints == 0 then return nil end
+    local pool = {}
+    for _, p in ipairs(patrolPoints) do
+        if exceptPos == nil or not Vec3.nearlyEqual(p.position, exceptPos, 0.1) then
+            table.insert(pool, p)
+        end
+    end
+    if #pool == 0 then pool = patrolPoints end
+    return pool[math.random(1, #pool)]
+end
+
+local function doPatrol(gNum, agent)
+    if agent == nil then return end
+    local gs  = ghostState[gNum]
+    local exc = gs.patrol and gs.patrol.targetPos or nil
+    local pt  = pickPatrol(exc)
+    if pt == nil then return end
+    agent:setDestination(pt.position)
+    gs.patrol = { targetPos = pt.position }
+    gs.target = nil
+end
+
+-- ── 유령 AI 틱 ───────────────────────────────────────────────
+local function tickGhost(gNum, agent)
+    if agent == nil or not roundActive then return end
+    local gs  = ghostState[gNum]
+    local pos = agent.agentPosition
+    local off = gNum * 7   -- 두 유령이 같은 틱에 연산하지 않도록 오프셋
+
+    -- 패트롤 포인트 도달 확인 (~1초마다)
+    if tickCount % 90 == off % 90 then
+        if gs.target == nil and gs.patrol ~= nil then
+            if Vec3.nearlyEqual(pos, gs.patrol.targetPos, 2) then
+                doPatrol(gNum, agent)
+            end
+        end
+    end
+
+    -- 타겟 추적/공격 (~0.5초마다)
+    if tickCount % 45 == (off * 2) % 45 then
+        if gs.target ~= nil then
+            -- 현재 타겟 추적 중
+            local ply = gs.target.ply
+            if ply == nil or eliminated[ply.playerName] then
+                gs.target = nil
+                doPatrol(gNum, agent)
+                return
+            end
+            if Vec3.nearlyEqual(pos, ply.bodyPosition, ATTACK_RANGE) then
+                -- 사정거리 안 → 공격
+                if not gs.target.attacking then
+                    gs.target.attacking = true
+                    agent:playAgentAnimation("Attack")
+                    local capturedPly = ply
+                    local capturedGs  = gs
+                    setTimeout(ATTACK_DELAY, function()
+                        -- 0.5초 후 판정 (PDF 스펙)
+                        if capturedGs.target ~= nil
+                           and capturedGs.target.ply == capturedPly then
+                            tagPlayer(capturedPly)
+                            capturedGs.target = nil
+                            doPatrol(gNum, agent)
+                        end
+                    end)
+                end
+            else
+                -- 계속 추적
+                agent:setDestination(ply.bodyPosition)
+            end
+        else
+            -- 새 타겟 탐색
+            for _, ply in ipairs(Players) do
+                if ply ~= nil and not eliminated[ply.playerName]
+                   and ply.playerMaterial ~= MAT_OUT then
+                    if Vec3.nearlyEqual(pos, ply.bodyPosition, TARGETING_RANGE) then
+                        gs.target  = { ply = ply, attacking = false }
+                        gs.patrol  = nil
+                        agent:setDestination(ply.bodyPosition)
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ── 메인 틱 ──────────────────────────────────────────────────
+function tick(dt)
+    handleTimeouts()
+    if not scriptReady then return end
+    if LocalPlayer == nil then return end
+    tickCount = tickCount + 1
+
+    -- 엔티티 권한자만 AI 및 라운드 관리
+    if LocalPlayer.isEntityAuthority and not waitingForInit then
+        tickGhost(1, ghost1)
+        tickGhost(2, ghost2)
+
+        -- 타이머 만료 체크
+        if roundActive then
+            local elapsed = os.clock() - roundStartTime
+            if elapsed >= ROUND_DURATION then
+                -- 시간 초과 → HP 가장 많은 플레이어 우승
+                local bestHP  = -1
+                local winner  = nil
+                for _, ply in ipairs(Players) do
+                    if ply ~= nil and not eliminated[ply.playerName] then
+                        local hp = playerHP[ply.playerName] or 0
+                        if hp > bestHP then bestHP = hp; winner = ply end
+                    end
+                end
+                endRound(winner)
+            end
+        end
+    end
+
+    -- UI 갱신 (~1초마다)
+    if tickCount % 90 == 0 then
+        updateScoreBoard()
+        updateTimer()
+    end
+end
+
+-- ── 네트워크 이벤트 ──────────────────────────────────────────
+function onEvent(event, data)
+
+    -- 태그 동기화 (권한자 → 나머지)
+    if event == "ghost_tagPlayer" then
+        local pName = data[1]
+        local hp    = data[2]
+        if pName ~= nil then
+            playerHP[pName]   = hp
+            if hp <= 0 then
+                eliminated[pName] = true
+                -- 로컬에서도 머티리얼 변경
+                for _, ply in ipairs(Players) do
+                    if ply ~= nil and ply.playerName == pName then
+                        ply.playerMaterial = MAT_OUT
+                        break
+                    end
+                end
+            end
+        end
+        updateScoreBoard()
+    end
+
+    -- 라운드 시작 동기화
+    if event == "ghost_roundStart" then
+        if not LocalPlayer.isEntityAuthority then
+            currentRound   = data[1]
+            roundActive    = true
+            roundStartTime = os.clock()
+            playerHP   = {}
+            eliminated = {}
+            for _, ply in ipairs(Players) do
+                if ply ~= nil then
+                    playerHP[ply.playerName]   = MAX_HP
+                    eliminated[ply.playerName] = false
+                    ply.playerMaterial         = MAT_NORMAL
+                end
+            end
+            updateScoreBoard()
+        end
+    end
+
+    -- 라운드 종료 동기화
+    if event == "ghost_roundEnd" then
+        if not LocalPlayer.isEntityAuthority then
+            roundActive = false
+            local winner = data[2]
+            if winner ~= nil then
+                roundWins[winner.playerName] =
+                    (roundWins[winner.playerName] or 0) + 1
+            end
+            updateScoreBoard()
+        end
+    end
+
+    -- 늦게 참가한 플레이어가 상태 요청
+    if event == "ghost_requestState" then
+        if LocalPlayer.isEntityAuthority then
+            emitEvent("ghost_syncState", {
+                currentRound, roundActive,
+                os.clock() - roundStartTime,
+                roundWins, playerHP, eliminated, gameFinished
+            })
+        end
+    end
+
+    -- 상태 수신
+    if event == "ghost_syncState" then
+        if waitingForInit then
+            currentRound   = data[1]
+            roundActive    = data[2]
+            roundStartTime = os.clock() - data[3]
+            roundWins      = data[4]
+            playerHP       = data[5]
+            eliminated     = data[6]
+            gameFinished   = data[7]
+            waitingForInit = false
+            scriptReady    = true
+            updateScoreBoard()
+            print("[Ghost] 상태 동기화 완료")
+        end
+    end
+
+    -- 에이전트 파괴 시 재초기화
+    if event == "agentDestroyed" then
+        ghost1 = nil; ghost2 = nil
+        scriptReady = false
+        setTimeout(2, initGhosts)
+    end
+end
+
+-- ── 초기화 ───────────────────────────────────────────────────
+function initGhosts()
+    if LocalPlayer == nil or InRoom == false then
+        setTimeout(1, initGhosts); return
+    end
+
+    ghost1 = AIAgent.findPrePlacedAIAgentByID(GHOST1_ID)
+    ghost2 = AIAgent.findPrePlacedAIAgentByID(GHOST2_ID)
+
+    if ghost1 == nil or ghost2 == nil then
+        print("[Ghost] 에이전트를 찾지 못함. 재시도...")
+        setTimeout(2, initGhosts); return
+    end
+
+    print("[Ghost] 에이전트 준비 완료 (ID=" ..
+          tostring(ghost1.entityID) .. ", " ..
+          tostring(ghost2.entityID) .. ")")
+
+    -- 권한 없으면 동기화 요청
+    if not LocalPlayer.isEntityAuthority then
+        waitingForInit = true
+        emitEvent("ghost_requestState", {})
+        return
+    end
+
+    -- 패트롤 포인트 수집
+    initPatrolPoints()
+
+    -- 라운드 우승 횟수 초기화
+    roundWins = {}
+    for _, ply in ipairs(Players) do
+        if ply ~= nil then roundWins[ply.playerName] = 0 end
+    end
+
+    gameFinished = false
+    startRound(1)
+
+    scriptReady = true
+    print("[Ghost] 스크립트 준비 완료 - Round 1 시작!")
+end
+
+-- ── 부팅 ─────────────────────────────────────────────────────
+initGhosts()
